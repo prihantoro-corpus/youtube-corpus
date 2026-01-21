@@ -8,3 +8,6 @@ openpyxl
 requests
 vaderSentiment
 openai-whisper
+deep-translator
+textblob
+stanza

@@ -12,36 +12,153 @@ import random
 import zipfile
 import requests
 import os
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from nltk.tokenize import sent_tokenize
+import html
+from nltk.tokenize import sent_tokenize, word_tokenize
 
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
+@st.cache_resource
+def download_nltk():
+    import nltk
+    nltk.download("punkt", quiet=True)
+    nltk.download("punkt_tab", quiet=True)
+
+download_nltk()
 
 # ---------------------------
-# Initializers
+# Initializers (Cached)
 # ---------------------------
 
-analyzer = SentimentIntensityAnalyzer()
-_whisper_model = None
+@st.cache_resource
+def get_analyzer():
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    return SentimentIntensityAnalyzer()
 
+@st.cache_resource
 def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        import whisper
-        # Using 'base' model for speed/accuracy balance
-        _whisper_model = whisper.load_model("base")
-    return _whisper_model
+    import whisper
+    # Using 'base' model for speed/accuracy balance
+    return whisper.load_model("base")
 
-def get_sentiment(text):
+@st.cache_resource
+def get_stanza_pipeline(lang):
+    import stanza
+    try:
+        # Map display codes to Stanza codes
+        s_map = {"zh-Hans": "zh-hans"}
+        s_code = s_map.get(lang, lang)
+        print(f"DEBUG: Checking Stanza model for: {s_code}")
+        # Use logging_level instead of quiet
+        stanza.download(s_code, processors='tokenize,pos,lemma', logging_level='WARN')
+        return stanza.Pipeline(s_code, processors='tokenize,pos,lemma', use_gpu=False, logging_level='WARN')
+    except Exception as e:
+        st.error(f"❌ Stanza Initialization Error: {e}")
+        raise e
+
+def xml_escape(text):
+    return html.escape(str(text))
+
+def get_sentiment(text, strategy="Translate to English", source_lang=None):
+    from deep_translator import GoogleTranslator
+    from textblob import TextBlob
+    
+    analyzer = get_analyzer()
+    if strategy == "Translate to English" and source_lang and source_lang != 'en':
+        try:
+            # Short-circuit if no English needed
+            translated = GoogleTranslator(source='auto', target='en').translate(text)
+            text = translated if translated else text
+        except Exception as e:
+            print(f"DEBUG: Translation error: {e}")
+            pass
+
+    # Use VADER (better for English or translated text)
     scores = analyzer.polarity_scores(text)
     compound = scores['compound']
+    
+    # TextBlob as fallback/secondary check if strategy is Language-specific
+    if strategy == "Language-specific" and source_lang != 'en':
+        try:
+            blob = TextBlob(text)
+            blob_score = blob.sentiment.polarity
+            # Average or normalize? Let's use simple threshold for now
+            if blob_score >= 0.1: return "Positive", blob_score
+            if blob_score <= -0.1: return "Negative", blob_score
+            return "Neutral", blob_score
+        except Exception:
+            pass
+
     if compound >= 0.05:
         return "Positive", compound
     elif compound <= -0.05:
         return "Negative", compound
     else:
         return "Neutral", compound
+
+def tag_sentence(text, lang_code, method="Automatic", uniform_tag="TAG"):
+    rows = []
+    if method == "Uniform":
+        try:
+            tokens = word_tokenize(text)
+        except Exception:
+            tokens = text.split()
+        for t in tokens:
+            rows.append({
+                "token": t,
+                "tag": uniform_tag,
+                "lemma": t
+            })
+    else:
+        # Automatic Mode
+        if lang_code == "en":
+            try:
+                import nltk
+                nltk.download("averaged_perceptron_tagger", quiet=True)
+                tokens = word_tokenize(text)
+                pos_tags = nltk.pos_tag(tokens)
+                for t, p in pos_tags:
+                    rows.append({
+                        "token": t,
+                        "tag": p,
+                        "lemma": t # NLTK doesn't have a simple lemmatizer without WordNet, keep as token
+                    })
+                return rows
+            except Exception as e:
+                print(f"DEBUG: NLTK English tagging error: {e}")
+                # Fallback to Stanza or Uniform if NLTK fails
+        
+        try:
+            with st.spinner(f"⌛ Loading tagging model for {lang_code}..."):
+                nlp = get_stanza_pipeline(lang_code)
+            doc = nlp(text)
+            for sent in doc.sentences:
+                for word in sent.words:
+                    rows.append({
+                        "token": word.text,
+                        "tag": word.upos or word.xpos or "UNK",
+                        "lemma": word.lemma or word.text
+                    })
+        except Exception as e:
+            msg = f"⚠️ Tagging Failed for {lang_code}: {e}. Switching to Uniform tagging for this text."
+            st.warning(msg)
+            print(f"DEBUG: {msg}")
+            # Explicitly switch to Uniform behavior for this call
+            return tag_sentence(text, lang_code, method="Uniform", uniform_tag=uniform_tag)
+    return rows
+
+def build_xml_block(id_attr, sentences_data):
+    """
+    id_attr: string (video_id or index)
+    sentences_data: list of dicts {num, sentiment, score, tokens: [{token, tag, lemma}]}
+    """
+    lines = [f'<text id="{xml_escape(id_attr)}">']
+    for s in sentences_data:
+        # sentiment_score is now the full name
+        lines.append(f'<s number="{s["num"]}" sentiment="{xml_escape(s["sentiment"])}" sentiment_score="{s["score"]}">')
+        for t in s["tokens"]:
+            # TREE TAGGER FORMAT: Must be aligned COMPLETELY LEFT
+            lines.append(f'{xml_escape(t["token"])}\t{xml_escape(t["tag"])}\t{xml_escape(t["lemma"])}')
+        lines.append('</s>')
+    lines.append('</text>')
+    return "\n".join(lines)
 
 # ---------------------------
 # Helpers
@@ -91,12 +208,12 @@ def asr_fallback(url):
             print(f"DEBUG: {video_id} - ASR error: {e}")
             return None
 
-def transcript_via_yt_dlp(url):
+def transcript_via_yt_dlp(url, target_lang="en"):
     video_id = extract_video_id(url)
     clients = [["android"], ["web"], ["mweb"]]
     
     for client in clients:
-        print(f"DEBUG: {video_id} - Attempting transcript with client: {client}")
+        print(f"DEBUG: {video_id} - Attempting transcript with client: {client} for lang: {target_lang}")
         ydl_opts = {
             "skip_download": True,
             "writesubtitles": True,
@@ -116,7 +233,7 @@ def transcript_via_yt_dlp(url):
         }
         headers = {
             "User-Agent": ua_map.get(client[0], ua_map["web"]),
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": f"{target_lang},en;q=0.9",
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -129,7 +246,11 @@ def transcript_via_yt_dlp(url):
                 if not combined_subs:
                     continue
 
-                lang = "en" if "en" in combined_subs else list(combined_subs.keys())[0]
+                # Targeted language match
+                lang = target_lang if target_lang in combined_subs else \
+                       ("en" if "en" in combined_subs else list(combined_subs.keys())[0])
+                
+                print(f"DEBUG: {video_id} - Available languages: {list(combined_subs.keys())}. Chosen: {lang}")
                 formats = combined_subs[lang]
                 
                 sub_url = None
@@ -169,16 +290,16 @@ def transcript_via_yt_dlp(url):
     return asr_fallback(url)
 
 
-def get_transcript(video_id, url):
+def get_transcript(video_id, url, target_lang="en"):
     try:
-        # Try direct API first
-        tr = YouTubeTranscriptApi.get_transcript(video_id)
+        # Try direct API first with target language
+        tr = YouTubeTranscriptApi.get_transcript(video_id, languages=[target_lang, 'en'])
         text = " ".join(t["text"] for t in tr)
         if "automated queries" in text or "Google Home" in text:
-            return transcript_via_yt_dlp(url)
+            return transcript_via_yt_dlp(url, target_lang)
         return text
     except Exception:
-        return transcript_via_yt_dlp(url)
+        return transcript_via_yt_dlp(url, target_lang)
 
 
 def get_comments(video_id, limit):
@@ -223,6 +344,36 @@ def get_comments(video_id, limit):
 st.set_page_config("YouTube Corpus Builder", layout="wide")
 st.title("📚 YouTube Corpus Builder (No API)")
 
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    target_lang_name = st.selectbox(
+        "Target Language",
+        ["English", "Indonesian", "Chinese", "Japanese", "Korean"],
+        index=0
+    )
+    lang_map = {
+        "English": "en",
+        "Indonesian": "id",
+        "Chinese": "zh-Hans",
+        "Japanese": "ja",
+        "Korean": "ko"
+    }
+    target_lang = lang_map[target_lang_name]
+
+    st.divider()
+    st.header("🧠 Sentiment Strategy")
+    st_strategy = st.radio(
+        "Analysis Method",
+        ["Translate to English", "Language-specific"],
+        help="Strategy A: Uses native analyzers. Strategy B: Translates to English before scoring."
+    )
+
+    st.divider()
+    st.header("🏷️ Tagging & Formatting")
+    enable_tagging = st.checkbox("Enable Tokenization & Tagging", value=True)
+    tag_method = st.radio("Tagging Method", ["Automatic", "Uniform"], index=0)
+    uniform_label = st.text_input("Uniform Tag Label", value="TAG")
+
 urls_input = st.text_area("YouTube links (one per line)", height=150)
 
 comment_limit = st.number_input(
@@ -241,10 +392,16 @@ if st.button("🚀 Build dataset"):
     transcript_book = {}
     comment_book = {}
     report_lines = []
+    
+    transcript_book = {}
+    comment_book = {}
+    
+    # Store for XML generation
+    transcript_xml_data = {} # {video_id: [sentences]}
+    comment_xml_data = {}    # {video_id: [sentences]}
 
     progress = st.progress(0)
     start = time.time()
-
     t_success = c_success = 0
 
     for i, url in enumerate(urls, 1):
@@ -258,8 +415,9 @@ if st.button("🚀 Build dataset"):
 
         # -------- Transcript --------
         transcript_sentences = []
+        xml_sents_t = []
         try:
-            transcript_text = get_transcript(video_id, url)
+            transcript_text = get_transcript(video_id, url, target_lang)
         except Exception as e:
             st.warning(f"⚠️ Transcript error for `{video_id}`: {e}")
             transcript_text = None
@@ -267,122 +425,170 @@ if st.button("🚀 Build dataset"):
         if transcript_text:
             st.success(f"✅ Transcript found for `{video_id}`")
             print(f"DEBUG: Successfully got transcript for {video_id} ({len(transcript_text)} chars)")
-            for s in sent_tokenize(transcript_text):
-                sent, score = get_sentiment(s)
-                transcript_sentences.append({
+            for s_num, s in enumerate(sent_tokenize(transcript_text), 1):
+                sent_cat, score = get_sentiment(s, strategy=st_strategy, source_lang=target_lang)
+                
+                # Tagging logic
+                tokens = []
+                if enable_tagging:
+                    tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label)
+                
+                row = {
                     "video_id": video_id,
                     "video_url": url,
+                    "sentence_num": s_num,
                     "sentence": s,
-                    "sentiment": sent,
+                    "sentiment": sent_cat,
                     "sentiment_score": score,
                     "scraped_at": datetime.now().isoformat()
+                }
+                transcript_sentences.append(row)
+                xml_sents_t.append({
+                    "num": s_num,
+                    "sentiment": sent_cat,
+                    "score": score,
+                    "tokens": tokens
                 })
+            
             t_success += 1
-            report_lines.append(
-                f"VIDEO {video_id}\nTranscript: SUCCESS ({len(transcript_sentences)} sentences)"
-            )
+            report_lines.append(f"VIDEO {video_id}\nTranscript: SUCCESS ({len(transcript_sentences)} sentences)")
+            transcript_xml_data[video_id] = xml_sents_t
         else:
-            print(f"DEBUG: Failed to get transcript for {video_id}")
-            report_lines.append(
-                f"VIDEO {video_id}\nTranscript: FAILED"
-            )
+            report_lines.append(f"VIDEO {video_id}\nTranscript: FAILED")
 
         transcript_book[video_id[:31]] = pd.DataFrame(transcript_sentences)
 
         # -------- Comments --------
         comment_rows = []
+        xml_sents_c = []
         try:
             comments = get_comments(video_id, None if comment_limit == 0 else comment_limit)
             if comments:
                 st.success(f"✅ Found {len(comments)} comments for `{video_id}`")
             else:
                 st.info(f"ℹ️ No comments returned for `{video_id}`")
-            for c in comments:
-                for s in sent_tokenize(c["text"]):
-                    sent, score = get_sentiment(s)
-                    comment_rows.append({
+            
+            for c_idx, c in enumerate(comments, 1):
+                for s_num, s in enumerate(sent_tokenize(c["text"]), 1):
+                    sent_cat, score = get_sentiment(s, strategy=st_strategy, source_lang=target_lang)
+                    
+                    tokens = []
+                    if enable_tagging:
+                        tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label)
+
+                    row = {
                         "video_id": video_id,
                         "video_url": url,
                         "author": c.get("author"),
                         "like_count": c.get("votes"),
                         "published_at": c.get("time"),
+                        "sentence_num": s_num,
                         "sentence": s,
-                        "sentiment": sent,
+                        "sentiment": sent_cat,
                         "sentiment_score": score,
                         "scraped_at": datetime.now().isoformat()
+                    }
+                    comment_rows.append(row)
+                    xml_sents_c.append({
+                        "num": s_num,
+                        "sentiment": sent_cat,
+                        "score": score,
+                        "tokens": tokens
                     })
+            
             c_success += 1
-            report_lines.append(
-                f"Comments: SUCCESS ({len(comment_rows)} sentences)\n"
-            )
+            report_lines.append(f"Comments: SUCCESS ({len(comment_rows)} sentences)\n")
+            comment_xml_data[video_id] = xml_sents_c
         except Exception as e:
             print(f"DEBUG: Failed to get comments for {video_id}: {e}")
             report_lines.append("Comments: FAILED\n")
 
         comment_book[video_id[:31]] = pd.DataFrame(comment_rows)
 
-    # Deduplication
-    transcript_book = {
-        k: v.drop_duplicates(subset=["sentence"]) for k, v in transcript_book.items()
-    }
-    comment_book = {
-        k: v.drop_duplicates(subset=["sentence"]) for k, v in comment_book.items()
-    }
+    # -------- Deduplication --------
+    transcript_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in transcript_book.items()}
+    comment_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in comment_book.items()}
 
-    # -------- Save files --------
-    tx_buf = BytesIO()
-    cm_buf = BytesIO()
-
-    with pd.ExcelWriter(tx_buf, engine="openpyxl") as w:
-        for sheet, df in transcript_book.items():
-            df.to_excel(w, sheet_name=sheet, index=False)
-
-    with pd.ExcelWriter(cm_buf, engine="openpyxl") as w:
-        for sheet, df in comment_book.items():
-            df.to_excel(w, sheet_name=sheet, index=False)
-
+    # -------- Final Prep --------
     runtime = round(time.time() - start, 2)
-
     report_lines.append(f"TOTAL VIDEOS: {len(urls)}")
     report_lines.append(f"TRANSCRIPTS SUCCESS: {t_success}")
     report_lines.append(f"COMMENTS SUCCESS: {c_success}")
     report_lines.append(f"RUNTIME: {runtime} seconds")
-
     report_text = "\n".join(report_lines)
 
-    st.success("Dataset ready.")
-
-    # Combined Previews
-    st.subheader("📊 Data Previews")
+    # -------- Export & Downloads --------
+    st.success("Analysis complete.")
+    st.subheader("📊 Output & Downloads")
     
-    # Safely concat dataframes
-    valid_transcripts = [df for df in transcript_book.values() if not df.empty]
-    valid_comments = [df for df in comment_book.values() if not df.empty]
-    
-    all_transcripts = pd.concat(valid_transcripts) if valid_transcripts else pd.DataFrame(columns=["video_id", "video_url", "sentence", "sentiment", "sentiment_score", "scraped_at"])
-    all_comments = pd.concat(valid_comments) if valid_comments else pd.DataFrame(columns=["video_id", "video_url", "author", "sentence", "sentiment", "sentiment_score", "scraped_at"])
+    # Pre-generate Excel buffers
+    tx_buf = BytesIO()
+    with pd.ExcelWriter(tx_buf, engine="openpyxl") as writer:
+        for sheet, df in transcript_book.items():
+            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
+            
+    cm_buf = BytesIO()
+    with pd.ExcelWriter(cm_buf, engine="openpyxl") as writer:
+        for sheet, df in comment_book.items():
+            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("### Transcripts")
-        st.dataframe(all_transcripts.head(100), use_container_width=True)
-    with col2:
-        st.write("### Comments")
-        st.dataframe(all_comments.head(100), use_container_width=True)
-
-    # Downloads
-    st.divider()
-    st.subheader("⬇ Download Section")
-
-    # Zip Generation
+    # Generate ZIP Hierarchical Buffer
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
-        zf.writestr("transcript.xlsx", tx_buf.getvalue())
-        zf.writestr("comments.xlsx", cm_buf.getvalue())
-        zf.writestr("report.txt", report_text)
+        # 1. Dataset Folder
+        zf.writestr("dataset/transcript.xlsx", tx_buf.getvalue())
+        zf.writestr("dataset/comments.xlsx", cm_buf.getvalue())
+        zf.writestr("dataset/report.txt", report_text)
+        
+        # 2. Corpus Separate Folder
+        for vid, sents in transcript_xml_data.items():
+            xml_content = build_xml_block(vid, sents)
+            zf.writestr(f"corpus/separate/transcript/{vid}.xml", xml_content.encode("utf-8"))
+            
+        for vid, sents in comment_xml_data.items():
+            xml_content = build_xml_block(vid, sents)
+            zf.writestr(f"corpus/separate/comments/{vid}.xml", xml_content.encode("utf-8"))
+            
+        # 3. Corpus Merged Folder
+        merged_t = ["<root>"]
+        for vid, sents in transcript_xml_data.items():
+            merged_t.append(build_xml_block(vid, sents))
+        merged_t.append("</root>")
+        zf.writestr("corpus/merged/transcripts.xml", "\n".join(merged_t).encode("utf-8"))
+        
+        merged_c = ["<root>"]
+        for vid, sents in comment_xml_data.items():
+            merged_c.append(build_xml_block(vid, sents))
+        merged_c.append("</root>")
+        zf.writestr("corpus/merged/comments.xml", "\n".join(merged_c).encode("utf-8"))
+
+    # Preview Tabs
+    tab_ds, tab_cp = st.tabs(["📁 Dataset Preview", "🌳 Corpus Preview"])
     
-    c1, c2, c3, c4 = st.columns(4)
-    c1.download_button("📦 Save All (ZIP)", zip_buf.getvalue(), "corpus_package.zip", type="primary")
-    c2.download_button("📄 Transcripts (.xlsx)", tx_buf.getvalue(), "transcript.xlsx")
-    c3.download_button("💬 Comments (.xlsx)", cm_buf.getvalue(), "comments.xlsx")
-    c4.download_button("📝 Report (.txt)", report_text, "report.txt")
+    with tab_ds:
+        valid_transcripts = [df for df in transcript_book.values() if not df.empty]
+        valid_comments = [df for df in comment_book.values() if not df.empty]
+        
+        all_transcripts = pd.concat(valid_transcripts) if valid_transcripts else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
+        all_comments = pd.concat(valid_comments) if valid_comments else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Transcripts** ({len(all_transcripts)} total rows)")
+            st.dataframe(all_transcripts.head(100), height=300)
+        with col2:
+            st.write(f"**Comments** ({len(all_comments)} total rows)")
+            st.dataframe(all_comments.head(100), height=300)
+            
+    with tab_cp:
+        st.write("**TreeTagger XML Format (Sample Snippet - 20 lines)**")
+        # Show first 20 lines of merged transcripts as a sample
+        sample_xml = "\n".join(merged_t[:20])
+        if len(merged_t) > 20: sample_xml += "\n..."
+        st.code(sample_xml, language="xml")
+
+    st.divider()
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    btn_col1.download_button("⬇️ Download All (ZIP Package)", zip_buf.getvalue(), "corpus_package.zip", use_container_width=True, type="primary")
+    btn_col2.download_button("⬇️ transcript.xlsx", tx_buf.getvalue(), "transcript.xlsx", use_container_width=True)
+    btn_col3.download_button("⬇️ comments.xlsx", cm_buf.getvalue(), "comments.xlsx", use_container_width=True)
