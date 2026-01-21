@@ -1,0 +1,8 @@
+streamlit
+pandas
+nltk
+yt-dlp
+youtube-transcript-api
+youtube-comment-downloader
+openpyxl
+requests
