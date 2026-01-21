@@ -6,3 +6,5 @@ youtube-transcript-api
 youtube-comment-downloader
 openpyxl
 requests
+vaderSentiment
+openai-whisper
