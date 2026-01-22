@@ -14,6 +14,7 @@ import requests
 import os
 import html
 from nltk.tokenize import sent_tokenize, word_tokenize
+import indonesian_utils
 
 @st.cache_resource
 def download_nltk():
@@ -37,6 +38,11 @@ def get_whisper_model():
     import whisper
     # Using 'base' model for speed/accuracy balance
     return whisper.load_model("base")
+
+@st.cache_resource
+def get_aksara_models():
+    from aksara import POSTagger, Lemmatizer
+    return POSTagger(), Lemmatizer()
 
 @st.cache_resource
 def get_stanza_pipeline(lang):
@@ -93,8 +99,21 @@ def get_sentiment(text, strategy="Translate to English", source_lang=None):
     else:
         return "Neutral", compound
 
-def tag_sentence(text, lang_code, method="Automatic", uniform_tag="TAG"):
+def tag_sentence(text, lang_code, method="Automatic", uniform_tag="TAG", **kwargs):
     rows = []
+    
+    # Pre-tokenization for Indonesian to handle clitics
+    if lang_code == "id" and kwargs.get("enable_clitic", False):
+        try:
+            # Use the clitic tokenizer
+            clitic_tokens = indonesian_utils.tokenize_text(text)
+            # Reconstruct text with spaces between split tokens for the taggers to consume
+            # This ensures "badanmu" -> "badan mu" so Stanza/Aksara sees them as separate words
+            text = " ".join(clitic_tokens)
+        except Exception as e:
+            print(f"DEBUG: Indonesian clitic tokenization failed: {e}")
+            # Fallback to original text if fails
+
     if method == "Uniform":
         try:
             tokens = word_tokenize(text)
@@ -108,6 +127,22 @@ def tag_sentence(text, lang_code, method="Automatic", uniform_tag="TAG"):
             })
     else:
         # Automatic Mode
+        if lang_code == "id" and kwargs.get("id_tagger") == "Aksara":
+            try:
+                pos_tagger, lemmatizer = get_aksara_models()
+                # Tagging returns list of [token, tag]
+                tags = pos_tagger.tag(text)
+                for t, p in tags:
+                    rows.append({
+                        "token": t,
+                        "tag": p,
+                        "lemma": lemmatizer.lemmatize(t)
+                    })
+                return rows
+            except Exception as e:
+                st.warning(f"⚠️ Aksara Tagging Failed: {e}. Falling back to Stanza.")
+                # Continue to Stanza fallback
+
         if lang_code == "en":
             try:
                 import nltk
@@ -318,6 +353,8 @@ def get_comments(video_id, limit):
             info = ydl.extract_info(url, download=False)
             raw_comments = info.get("comments", [])
             for c in raw_comments:
+                if limit and len(comments_list) >= limit:
+                    break
                 comments_list.append({
                     "author": c.get("author"),
                     "text": c.get("text"),
@@ -372,6 +409,14 @@ with st.sidebar:
     st.header("🏷️ Tagging & Formatting")
     enable_tagging = st.checkbox("Enable Tokenization & Tagging", value=True)
     tag_method = st.radio("Tagging Method", ["Automatic", "Uniform"], index=0)
+    
+    id_tagger = "Stanza"
+    enable_clitic = False
+    if target_lang == "id":
+        if tag_method == "Automatic":
+            id_tagger = st.radio("Indonesian Tagger Model", ["Stanza", "Aksara"], index=1, help="Aksara is often more accurate for Indonesian.")
+        enable_clitic = st.checkbox("Enable Clitic Tokenization", value=True, help="Splits clitics (e.g. 'ku-', '-mu') before tagging. Disabling this may speed up processing.")
+        
     uniform_label = st.text_input("Uniform Tag Label", value="TAG")
 
 urls_input = st.text_area("YouTube links (one per line)", height=150)
@@ -409,11 +454,46 @@ if st.button("🚀 Build dataset"):
         video_id = extract_video_id(url)
         st.info(f"🔍 Processing video {i}/{len(urls)}: `{video_id}`")
         
+        # Granular Status
+        status_box = st.empty()
+        
         # Avoid rapid blocks
         if i > 1:
             time.sleep(random.uniform(2, 5))
 
         # -------- Transcript --------
+        # -------- Checklist UI Helper --------
+        def render_checklist(stage, detail=""):
+            # Stages: init, trans_find, trans_tok, comm_find, comm_tok, done
+            
+            # Icons
+            s_pend = "⚪"
+            s_run = "🔄" 
+            s_done = "✅"
+            s_fail = "❌"
+            
+            # States
+            st_t_find = s_run if stage == "trans_find" else (s_done if stage in ["trans_tok", "comm_find", "comm_tok", "done"] else s_pend)
+            st_t_tok  = s_run if stage == "trans_tok"  else (s_done if stage in ["comm_find", "comm_tok", "done"] else s_pend)
+            st_c_find = s_run if stage == "comm_find"  else (s_done if stage in ["comm_tok", "done"] else s_pend)
+            st_c_tok  = s_run if stage == "comm_tok"   else (s_done if stage == "done" else s_pend)
+            
+            current_action = f"**Current Action:** {detail}" if detail else ""
+            
+            md = f"""
+            ### Processing `{video_id}`
+            
+            {st_t_find} **1. Find Transcript**
+            {st_t_tok} **2. Tokenize Transcript**
+            {st_c_find} **3. Fetch Comments**
+            {st_c_tok} **4. Tokenize Comments**
+            
+            {current_action}
+            """
+            status_box.markdown(md)
+
+        # -------- Transcript --------
+        render_checklist("trans_find", "Searching for transcript...")
         transcript_sentences = []
         xml_sents_t = []
         try:
@@ -431,7 +511,9 @@ if st.button("🚀 Build dataset"):
                 # Tagging logic
                 tokens = []
                 if enable_tagging:
-                    tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label)
+                    if s_num % 10 == 0:
+                        render_checklist("trans_tok", f"Tokenizing sentence {s_num}...")
+                    tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label, id_tagger=id_tagger, enable_clitic=enable_clitic)
                 
                 row = {
                     "video_id": video_id,
@@ -459,6 +541,8 @@ if st.button("🚀 Build dataset"):
         transcript_book[video_id[:31]] = pd.DataFrame(transcript_sentences)
 
         # -------- Comments --------
+        # -------- Comments --------
+        render_checklist("comm_find", "Fetching comments...")
         comment_rows = []
         xml_sents_c = []
         try:
@@ -474,7 +558,9 @@ if st.button("🚀 Build dataset"):
                     
                     tokens = []
                     if enable_tagging:
-                        tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label)
+                        if s_num % 5 == 0:
+                            render_checklist("comm_tok", f"Tokenizing comment {c_idx}, sentence {s_num}...")
+                        tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label, id_tagger=id_tagger, enable_clitic=enable_clitic)
 
                     row = {
                         "video_id": video_id,
@@ -504,6 +590,7 @@ if st.button("🚀 Build dataset"):
             report_lines.append("Comments: FAILED\n")
 
         comment_book[video_id[:31]] = pd.DataFrame(comment_rows)
+        render_checklist("done", "Finished.")
 
     # -------- Deduplication --------
     transcript_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in transcript_book.items()}
@@ -524,13 +611,23 @@ if st.button("🚀 Build dataset"):
     # Pre-generate Excel buffers
     tx_buf = BytesIO()
     with pd.ExcelWriter(tx_buf, engine="openpyxl") as writer:
+        has_sheet = False
         for sheet, df in transcript_book.items():
-            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
+            if not df.empty:
+                df.to_excel(writer, sheet_name=sheet, index=False)
+                has_sheet = True
+        if not has_sheet:
+            pd.DataFrame({"Info": ["No transcripts found"]}).to_excel(writer, sheet_name="No Data", index=False)
             
     cm_buf = BytesIO()
     with pd.ExcelWriter(cm_buf, engine="openpyxl") as writer:
+        has_sheet = False
         for sheet, df in comment_book.items():
-            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
+            if not df.empty:
+                df.to_excel(writer, sheet_name=sheet, index=False)
+                has_sheet = True
+        if not has_sheet:
+            pd.DataFrame({"Info": ["No comments found"]}).to_excel(writer, sheet_name="No Data", index=False)
 
     # Generate ZIP Hierarchical Buffer
     zip_buf = BytesIO()

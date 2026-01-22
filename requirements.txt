@@ -2,6 +2,7 @@ streamlit
 pandas
 nltk
 yt-dlp
+aksara
 youtube-transcript-api
 youtube-comment-downloader
 openpyxl
