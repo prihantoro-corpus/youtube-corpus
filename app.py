@@ -179,19 +179,31 @@ def tag_sentence(text, lang_code, method="Automatic", uniform_tag="TAG", **kwarg
             return tag_sentence(text, lang_code, method="Uniform", uniform_tag=uniform_tag)
     return rows
 
-def build_xml_block(id_attr, sentences_data):
+def build_xml_block(id_attr, data):
     """
     id_attr: string (video_id or index)
-    sentences_data: list of dicts {num, sentiment, score, tokens: [{token, tag, lemma}]}
+    data: list of dicts 
+          If transcript: {num, sentiment, score, tokens: [{token, tag, lemma}]}
+          If comments: {author, sentences: [{num, sentiment, score, tokens: [...]}]}
     """
     lines = [f'<text id="{xml_escape(id_attr)}">']
-    for s in sentences_data:
-        # sentiment_score is now the full name
-        lines.append(f'<s number="{s["num"]}" sentiment="{xml_escape(s["sentiment"])}" sentiment_score="{s["score"]}">')
-        for t in s["tokens"]:
-            # TREE TAGGER FORMAT: Must be aligned COMPLETELY LEFT
-            lines.append(f'{xml_escape(t["token"])}\t{xml_escape(t["tag"])}\t{xml_escape(t["lemma"])}')
-        lines.append('</s>')
+    for entry in data:
+        if "author" in entry:
+            # Comment grouping
+            lines.append(f'<comment author="{xml_escape(entry["author"])}">')
+            for s in entry["sentences"]:
+                lines.append(f'<s number="{s["num"]}" sentiment="{xml_escape(s["sentiment"])}" sentiment_score="{s["score"]}">')
+                for t in s["tokens"]:
+                    lines.append(f'{xml_escape(t["token"])}\t{xml_escape(t["tag"])}\t{xml_escape(t["lemma"])}')
+                lines.append('</s>')
+            lines.append('</comment>')
+        else:
+            # Single sentence (Transcript)
+            s = entry
+            lines.append(f'<s number="{s["num"]}" sentiment="{xml_escape(s["sentiment"])}" sentiment_score="{s["score"]}">')
+            for t in s["tokens"]:
+                lines.append(f'{xml_escape(t["token"])}\t{xml_escape(t["tag"])}\t{xml_escape(t["lemma"])}')
+            lines.append('</s>')
     lines.append('</text>')
     return "\n".join(lines)
 
@@ -553,6 +565,12 @@ if st.button("🚀 Build dataset"):
                 st.info(f"ℹ️ No comments returned for `{video_id}`")
             
             for c_idx, c in enumerate(comments, 1):
+                comment_author = c.get("author") or "Unknown"
+                current_comment_xml = {
+                    "author": comment_author,
+                    "sentences": []
+                }
+                
                 for s_num, s in enumerate(sent_tokenize(c["text"]), 1):
                     sent_cat, score = get_sentiment(s, strategy=st_strategy, source_lang=target_lang)
                     
@@ -565,7 +583,7 @@ if st.button("🚀 Build dataset"):
                     row = {
                         "video_id": video_id,
                         "video_url": url,
-                        "author": c.get("author"),
+                        "author": comment_author,
                         "like_count": c.get("votes"),
                         "published_at": c.get("time"),
                         "sentence_num": s_num,
@@ -575,12 +593,16 @@ if st.button("🚀 Build dataset"):
                         "scraped_at": datetime.now().isoformat()
                     }
                     comment_rows.append(row)
-                    xml_sents_c.append({
+                    
+                    current_comment_xml["sentences"].append({
                         "num": s_num,
                         "sentiment": sent_cat,
                         "score": score,
                         "tokens": tokens
                     })
+                
+                if current_comment_xml["sentences"]:
+                    xml_sents_c.append(current_comment_xml)
             
             c_success += 1
             report_lines.append(f"Comments: SUCCESS ({len(comment_rows)} sentences)\n")
@@ -594,7 +616,7 @@ if st.button("🚀 Build dataset"):
 
     # -------- Deduplication --------
     transcript_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in transcript_book.items()}
-    comment_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in comment_book.items()}
+    comment_book = {k: v.drop_duplicates(subset=["author", "sentence"]) for k, v in comment_book.items()}
 
     # -------- Final Prep --------
     runtime = round(time.time() - start, 2)
@@ -667,7 +689,7 @@ if st.button("🚀 Build dataset"):
         valid_comments = [df for df in comment_book.values() if not df.empty]
         
         all_transcripts = pd.concat(valid_transcripts) if valid_transcripts else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
-        all_comments = pd.concat(valid_comments) if valid_comments else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
+        all_comments = pd.concat(valid_comments) if valid_comments else pd.DataFrame(columns=["video_id", "author", "sentence", "sentiment"])
 
         col1, col2 = st.columns(2)
         with col1:
