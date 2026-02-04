@@ -356,7 +356,7 @@ def get_comments(video_id, limit):
         "extractor_args": {"youtube": {"player_client": ["android"]}},
         "skip_download": True,
         "getcomments": True,
-        "max_comments": limit if limit > 0 else None,
+        "max_comments": limit if (limit is not None and limit > 0) else None,
     }
     
     comments_list = []
@@ -394,6 +394,8 @@ st.set_page_config("YouTube Corpus Builder", layout="wide")
 st.title("📚 YouTube Corpus Builder (No API)")
 
 with st.sidebar:
+    st.markdown("[📖 Manual](https://docs.google.com/document/d/1aTAcBRw94P3WBzOsHJbb0hIeTZNTW3x0/edit?usp=sharing&ouid=101822844091249125937&rtpof=true&sd=true)")
+    st.divider()
     st.header("⚙️ Configuration")
     target_lang_name = st.selectbox(
         "Target Language",
@@ -431,80 +433,75 @@ with st.sidebar:
         
     uniform_label = st.text_input("Uniform Tag Label", value="TAG")
 
+if "transcript_book" not in st.session_state: st.session_state.transcript_book = {}
+if "comment_book" not in st.session_state: st.session_state.comment_book = {}
+if "transcript_xml_data" not in st.session_state: st.session_state.transcript_xml_data = {}
+if "comment_xml_data" not in st.session_state: st.session_state.comment_xml_data = {}
+if "report_lines" not in st.session_state: st.session_state.report_lines = []
+if "batch_stats" not in st.session_state: st.session_state.batch_stats = {"t_success": 0, "c_success": 0, "runtime": 0, "total": 0}
+
 urls_input = st.text_area("YouTube links (one per line)", height=150)
 
-comment_limit = st.number_input(
-    "Number of comments (0 = all)",
-    min_value=0,
-    value=100,
-    step=50
-)
+col_ui1, col_ui2 = st.columns([1, 2])
+with col_ui1:
+    download_all = st.checkbox("Download all comments", value=False)
+with col_ui2:
+    custom_limit = st.number_input("Comment limit", min_value=1, value=100, step=50, disabled=download_all)
 
-if st.button("🚀 Build dataset"):
+comment_limit = 0 if download_all else custom_limit
+
+btn_col_a, btn_col_b = st.columns([1, 1])
+with btn_col_a:
+    build_clicked = st.button("🚀 Build dataset", use_container_width=True)
+with btn_col_b:
+    if st.button("🗑️ Clear Results", use_container_width=True):
+        st.session_state.transcript_book = {}
+        st.session_state.comment_book = {}
+        st.session_state.transcript_xml_data = {}
+        st.session_state.comment_xml_data = {}
+        st.session_state.report_lines = []
+        st.session_state.batch_stats = {"t_success": 0, "c_success": 0, "runtime": 0, "total": 0}
+        st.rerun()
+
+if build_clicked:
     urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
     if not urls:
         st.error("Please enter at least one URL.")
         st.stop()
 
-    transcript_book = {}
-    comment_book = {}
-    report_lines = []
-    
-    transcript_book = {}
-    comment_book = {}
-    
-    # Store for XML generation
-    transcript_xml_data = {} # {video_id: [sentences]}
-    comment_xml_data = {}    # {video_id: [sentences]}
-
+    st.session_state.batch_stats["total"] = len(urls)
     progress = st.progress(0)
-    start = time.time()
-    t_success = c_success = 0
+    start_batch = time.time()
+    t_success = st.session_state.batch_stats["t_success"]
+    c_success = st.session_state.batch_stats["c_success"]
 
     for i, url in enumerate(urls, 1):
         progress.progress(i / len(urls))
         video_id = extract_video_id(url)
-        st.info(f"🔍 Processing video {i}/{len(urls)}: `{video_id}`")
         
-        # Granular Status
-        status_box = st.empty()
-        
-        # Avoid rapid blocks
-        if i > 1:
-            time.sleep(random.uniform(2, 5))
+        # Check if already processed in this session to allow "resuming" if one clicks Build again
+        if video_id and any(video_id in k for k in st.session_state.transcript_book.keys()):
+            st.info(f"⏭️ Skipping `{video_id}` (Already processed)")
+            continue
 
-        # -------- Transcript --------
-        # -------- Checklist UI Helper --------
+        st.info(f"🔍 Processing video {i}/{len(urls)}: `{video_id}`")
+        status_col, dl_col = st.columns([4, 1])
+        status_box = status_col.empty()
+        dl_box = dl_col.empty()
+        
+        if i > 1: time.sleep(random.uniform(2, 5))
+
         def render_checklist(stage, detail=""):
-            # Stages: init, trans_find, trans_tok, comm_find, comm_tok, done
-            
-            # Icons
-            s_pend = "⚪"
-            s_run = "🔄" 
-            s_done = "✅"
-            s_fail = "❌"
-            
-            # States
+            s_pend, s_run, s_done = "⚪", "🔄", "✅"
             st_t_find = s_run if stage == "trans_find" else (s_done if stage in ["trans_tok", "comm_find", "comm_tok", "done"] else s_pend)
             st_t_tok  = s_run if stage == "trans_tok"  else (s_done if stage in ["comm_find", "comm_tok", "done"] else s_pend)
             st_c_find = s_run if stage == "comm_find"  else (s_done if stage in ["comm_tok", "done"] else s_pend)
             st_c_tok  = s_run if stage == "comm_tok"   else (s_done if stage == "done" else s_pend)
-            
             current_action = f"**Current Action:** {detail}" if detail else ""
-            
-            md = f"""
-            ### Processing `{video_id}`
-            
-            {st_t_find} **1. Find Transcript**
-            {st_t_tok} **2. Tokenize Transcript**
-            {st_c_find} **3. Fetch Comments**
-            {st_c_tok} **4. Tokenize Comments**
-            
-            {current_action}
-            """
+            md = f"### `{video_id}`\n\n{st_t_find} **1. Find Transcript**\n{st_t_tok} **2. Tokenize Transcript**\n{st_c_find} **3. Fetch Comments**\n{st_c_tok} **4. Tokenize Comments**\n\n{current_action}"
             status_box.markdown(md)
 
-        # -------- Transcript --------
+        # Processing logic...
         render_checklist("trans_find", "Searching for transcript...")
         transcript_sentences = []
         xml_sents_t = []
@@ -516,195 +513,137 @@ if st.button("🚀 Build dataset"):
 
         if transcript_text:
             st.success(f"✅ Transcript found for `{video_id}`")
-            print(f"DEBUG: Successfully got transcript for {video_id} ({len(transcript_text)} chars)")
             for s_num, s in enumerate(sent_tokenize(transcript_text), 1):
                 sent_cat, score = get_sentiment(s, strategy=st_strategy, source_lang=target_lang)
-                
-                # Tagging logic
                 tokens = []
                 if enable_tagging:
-                    if s_num % 10 == 0:
-                        render_checklist("trans_tok", f"Tokenizing sentence {s_num}...")
+                    if s_num % 10 == 0: render_checklist("trans_tok", f"Tokenizing sentence {s_num}...")
                     tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label, id_tagger=id_tagger, enable_clitic=enable_clitic)
-                
-                row = {
-                    "video_id": video_id,
-                    "video_url": url,
-                    "sentence_num": s_num,
-                    "sentence": s,
-                    "sentiment": sent_cat,
-                    "sentiment_score": score,
-                    "scraped_at": datetime.now().isoformat()
-                }
-                transcript_sentences.append(row)
-                xml_sents_t.append({
-                    "num": s_num,
-                    "sentiment": sent_cat,
-                    "score": score,
-                    "tokens": tokens
+                transcript_sentences.append({
+                    "video_id": video_id, "video_url": url, "sentence_num": s_num, "sentence": s,
+                    "sentiment": sent_cat, "sentiment_score": score, "scraped_at": datetime.now().isoformat()
                 })
-            
+                xml_sents_t.append({"num": s_num, "sentiment": sent_cat, "score": score, "tokens": tokens})
             t_success += 1
-            report_lines.append(f"VIDEO {video_id}\nTranscript: SUCCESS ({len(transcript_sentences)} sentences)")
-            transcript_xml_data[video_id] = xml_sents_t
+            st.session_state.report_lines.append(f"VIDEO {video_id}\nTranscript: SUCCESS ({len(transcript_sentences)} sentences)")
+            st.session_state.transcript_xml_data[video_id] = xml_sents_t
         else:
-            report_lines.append(f"VIDEO {video_id}\nTranscript: FAILED")
+            st.session_state.report_lines.append(f"VIDEO {video_id}\nTranscript: FAILED")
 
-        transcript_book[video_id[:31]] = pd.DataFrame(transcript_sentences)
+        st.session_state.transcript_book[video_id[:31]] = pd.DataFrame(transcript_sentences)
 
-        # -------- Comments --------
-        # -------- Comments --------
         render_checklist("comm_find", "Fetching comments...")
         comment_rows = []
         xml_sents_c = []
         try:
             comments = get_comments(video_id, None if comment_limit == 0 else comment_limit)
-            if comments:
-                st.success(f"✅ Found {len(comments)} comments for `{video_id}`")
-            else:
-                st.info(f"ℹ️ No comments returned for `{video_id}`")
-            
             for c_idx, c in enumerate(comments, 1):
                 comment_author = c.get("author") or "Unknown"
-                current_comment_xml = {
-                    "author": comment_author,
-                    "sentences": []
-                }
-                
+                current_comment_xml = {"author": comment_author, "sentences": []}
                 for s_num, s in enumerate(sent_tokenize(c["text"]), 1):
                     sent_cat, score = get_sentiment(s, strategy=st_strategy, source_lang=target_lang)
-                    
                     tokens = []
                     if enable_tagging:
-                        if s_num % 5 == 0:
-                            render_checklist("comm_tok", f"Tokenizing comment {c_idx}, sentence {s_num}...")
+                        if s_num % 5 == 0: render_checklist("comm_tok", f"Tokenizing comment {c_idx}, sentence {s_num}...")
                         tokens = tag_sentence(s, target_lang, method=tag_method, uniform_tag=uniform_label, id_tagger=id_tagger, enable_clitic=enable_clitic)
-
-                    row = {
-                        "video_id": video_id,
-                        "video_url": url,
-                        "author": comment_author,
-                        "like_count": c.get("votes"),
-                        "published_at": c.get("time"),
-                        "sentence_num": s_num,
-                        "sentence": s,
-                        "sentiment": sent_cat,
-                        "sentiment_score": score,
-                        "scraped_at": datetime.now().isoformat()
-                    }
-                    comment_rows.append(row)
-                    
-                    current_comment_xml["sentences"].append({
-                        "num": s_num,
-                        "sentiment": sent_cat,
-                        "score": score,
-                        "tokens": tokens
+                    comment_rows.append({
+                        "video_id": video_id, "video_url": url, "author": comment_author, "like_count": c.get("votes"),
+                        "published_at": c.get("time"), "sentence_num": s_num, "sentence": s,
+                        "sentiment": sent_cat, "sentiment_score": score, "scraped_at": datetime.now().isoformat()
                     })
-                
-                if current_comment_xml["sentences"]:
-                    xml_sents_c.append(current_comment_xml)
-            
+                    current_comment_xml["sentences"].append({"num": s_num, "sentiment": sent_cat, "score": score, "tokens": tokens})
+                if current_comment_xml["sentences"]: xml_sents_c.append(current_comment_xml)
             c_success += 1
-            report_lines.append(f"Comments: SUCCESS ({len(comment_rows)} sentences)\n")
-            comment_xml_data[video_id] = xml_sents_c
-        except Exception as e:
-            print(f"DEBUG: Failed to get comments for {video_id}: {e}")
-            report_lines.append("Comments: FAILED\n")
+            st.session_state.report_lines.append(f"Comments: SUCCESS ({len(comment_rows)} sentences)\n")
+            st.session_state.comment_xml_data[video_id] = xml_sents_c
+        except Exception:
+            st.session_state.report_lines.append("Comments: FAILED\n")
 
-        comment_book[video_id[:31]] = pd.DataFrame(comment_rows)
+        st.session_state.comment_book[video_id[:31]] = pd.DataFrame(comment_rows)
         render_checklist("done", "Finished.")
+        
+        try:
+            v_zip_buf = BytesIO()
+            with zipfile.ZipFile(v_zip_buf, "w") as zf:
+                if not pd.DataFrame(transcript_sentences).empty:
+                    tx_v_buf = BytesIO()
+                    pd.DataFrame(transcript_sentences).to_excel(tx_v_buf, index=False)
+                    zf.writestr("transcript.xlsx", tx_v_buf.getvalue())
+                if not pd.DataFrame(comment_rows).empty:
+                    cm_v_buf = BytesIO()
+                    pd.DataFrame(comment_rows).to_excel(cm_v_buf, index=False)
+                    zf.writestr("comments.xlsx", cm_v_buf.getvalue())
+                if xml_sents_t: zf.writestr(f"transcript_{video_id}.xml", build_xml_block(video_id, xml_sents_t).encode("utf-8"))
+                if xml_sents_c: zf.writestr(f"comments_{video_id}.xml", build_xml_block(video_id, xml_sents_c).encode("utf-8"))
+            dl_box.download_button(label=f"⬇️ {video_id} ZIP", data=v_zip_buf.getvalue(), file_name=f"youtube_{video_id}.zip", key=f"dl_{video_id}_{i}_{time.time()}", use_container_width=True)
+        except Exception: pass
 
-    # -------- Deduplication --------
-    transcript_book = {k: v.drop_duplicates(subset=["sentence"]) for k, v in transcript_book.items()}
-    comment_book = {k: v.drop_duplicates(subset=["author", "sentence"]) for k, v in comment_book.items()}
+    st.session_state.batch_stats.update({
+        "t_success": t_success, "c_success": c_success,
+        "runtime": round(time.time() - start_batch, 2)
+    })
+    st.rerun()
 
-    # -------- Final Prep --------
-    runtime = round(time.time() - start, 2)
-    report_lines.append(f"TOTAL VIDEOS: {len(urls)}")
-    report_lines.append(f"TRANSCRIPTS SUCCESS: {t_success}")
-    report_lines.append(f"COMMENTS SUCCESS: {c_success}")
-    report_lines.append(f"RUNTIME: {runtime} seconds")
-    report_text = "\n".join(report_lines)
+# ---------------------------
+# Persisted Results Rendering
+# ---------------------------
+if st.session_state.transcript_book or st.session_state.comment_book:
+    st.divider()
+    st.success("Analysis results (Persisted in Session State)")
+    
+    report_text = "\n".join(st.session_state.report_lines)
+    report_text += f"\nTOTAL VIDEOS: {st.session_state.batch_stats['total']}\n"
+    report_text += f"TRANSCRIPTS SUCCESS: {st.session_state.batch_stats['t_success']}\n"
+    report_text += f"COMMENTS SUCCESS: {st.session_state.batch_stats['c_success']}\n"
+    report_text += f"RUNTIME: {st.session_state.batch_stats['runtime']} seconds"
 
-    # -------- Export & Downloads --------
-    st.success("Analysis complete.")
     st.subheader("📊 Output & Downloads")
     
-    # Pre-generate Excel buffers
+    # Final ZIP and Excel Generation
     tx_buf = BytesIO()
     with pd.ExcelWriter(tx_buf, engine="openpyxl") as writer:
-        has_sheet = False
-        for sheet, df in transcript_book.items():
-            if not df.empty:
-                df.to_excel(writer, sheet_name=sheet, index=False)
-                has_sheet = True
-        if not has_sheet:
-            pd.DataFrame({"Info": ["No transcripts found"]}).to_excel(writer, sheet_name="No Data", index=False)
+        for sheet, df in st.session_state.transcript_book.items():
+            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
+        if not st.session_state.transcript_book: pd.DataFrame({"Info": ["No transcripts"]}).to_excel(writer, sheet_name="No Data", index=False)
             
     cm_buf = BytesIO()
     with pd.ExcelWriter(cm_buf, engine="openpyxl") as writer:
-        has_sheet = False
-        for sheet, df in comment_book.items():
-            if not df.empty:
-                df.to_excel(writer, sheet_name=sheet, index=False)
-                has_sheet = True
-        if not has_sheet:
-            pd.DataFrame({"Info": ["No comments found"]}).to_excel(writer, sheet_name="No Data", index=False)
+        for sheet, df in st.session_state.comment_book.items():
+            if not df.empty: df.to_excel(writer, sheet_name=sheet, index=False)
+        if not st.session_state.comment_book: pd.DataFrame({"Info": ["No comments"]}).to_excel(writer, sheet_name="No Data", index=False)
 
-    # Generate ZIP Hierarchical Buffer
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, "w") as zf:
-        # 1. Dataset Folder
         zf.writestr("dataset/transcript.xlsx", tx_buf.getvalue())
         zf.writestr("dataset/comments.xlsx", cm_buf.getvalue())
         zf.writestr("dataset/report.txt", report_text)
+        for vid, sents in st.session_state.transcript_xml_data.items():
+            zf.writestr(f"corpus/separate/transcript/{vid}.xml", build_xml_block(vid, sents).encode("utf-8"))
+        for vid, sents in st.session_state.comment_xml_data.items():
+            zf.writestr(f"corpus/separate/comments/{vid}.xml", build_xml_block(vid, sents).encode("utf-8"))
         
-        # 2. Corpus Separate Folder
-        for vid, sents in transcript_xml_data.items():
-            xml_content = build_xml_block(vid, sents)
-            zf.writestr(f"corpus/separate/transcript/{vid}.xml", xml_content.encode("utf-8"))
-            
-        for vid, sents in comment_xml_data.items():
-            xml_content = build_xml_block(vid, sents)
-            zf.writestr(f"corpus/separate/comments/{vid}.xml", xml_content.encode("utf-8"))
-            
-        # 3. Corpus Merged Folder
-        merged_t = ["<root>"]
-        for vid, sents in transcript_xml_data.items():
-            merged_t.append(build_xml_block(vid, sents))
-        merged_t.append("</root>")
+        merged_t = ["<root>"] + [build_xml_block(v, s) for v, s in st.session_state.transcript_xml_data.items()] + ["</root>"]
         zf.writestr("corpus/merged/transcripts.xml", "\n".join(merged_t).encode("utf-8"))
-        
-        merged_c = ["<root>"]
-        for vid, sents in comment_xml_data.items():
-            merged_c.append(build_xml_block(vid, sents))
-        merged_c.append("</root>")
+        merged_c = ["<root>"] + [build_xml_block(v, s) for v, s in st.session_state.comment_xml_data.items()] + ["</root>"]
         zf.writestr("corpus/merged/comments.xml", "\n".join(merged_c).encode("utf-8"))
 
-    # Preview Tabs
     tab_ds, tab_cp = st.tabs(["📁 Dataset Preview", "🌳 Corpus Preview"])
-    
     with tab_ds:
-        valid_transcripts = [df for df in transcript_book.values() if not df.empty]
-        valid_comments = [df for df in comment_book.values() if not df.empty]
-        
-        all_transcripts = pd.concat(valid_transcripts) if valid_transcripts else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
-        all_comments = pd.concat(valid_comments) if valid_comments else pd.DataFrame(columns=["video_id", "author", "sentence", "sentiment"])
-
+        v_t = [df for df in st.session_state.transcript_book.values() if not df.empty]
+        v_c = [df for df in st.session_state.comment_book.values() if not df.empty]
+        all_t = pd.concat(v_t) if v_t else pd.DataFrame(columns=["video_id", "sentence", "sentiment"])
+        all_c = pd.concat(v_c) if v_c else pd.DataFrame(columns=["video_id", "author", "sentence", "sentiment"])
         col1, col2 = st.columns(2)
         with col1:
-            st.write(f"**Transcripts** ({len(all_transcripts)} total rows)")
-            st.dataframe(all_transcripts.head(100), height=300)
+            st.write(f"**Transcripts** ({len(all_t)} total)")
+            st.dataframe(all_t.head(100), height=300)
         with col2:
-            st.write(f"**Comments** ({len(all_comments)} total rows)")
-            st.dataframe(all_comments.head(100), height=300)
+            st.write(f"**Comments** ({len(all_c)} total)")
+            st.dataframe(all_c.head(100), height=300)
             
     with tab_cp:
-        st.write("**TreeTagger XML Format (Sample Snippet - 20 lines)**")
-        # Show first 20 lines of merged transcripts as a sample
-        sample_xml = "\n".join(merged_t[:20])
-        if len(merged_t) > 20: sample_xml += "\n..."
-        st.code(sample_xml, language="xml")
+        st.write("**TreeTagger XML Format (Sample Snippet)**")
+        st.code("\n".join(merged_t[:20]) + ("\n..." if len(merged_t) > 20 else ""), language="xml")
 
     st.divider()
     btn_col1, btn_col2, btn_col3 = st.columns(3)
